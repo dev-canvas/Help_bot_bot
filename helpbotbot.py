@@ -1,15 +1,18 @@
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 import aiosqlite
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -23,9 +26,14 @@ if not API_TOKEN or not ADMIN_ID:
     raise ValueError("Укажите TELEGRAM_BOT_TOKEN и ADMIN_ID в переменных окружения")
 
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 DB_PATH = "/app/data/users.db"
+
+# FSM для ответов
+class ReplyState(StatesGroup):
+    waiting_reply = State()
 
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -45,9 +53,7 @@ async def get_user_chat(user_id: int) -> Optional[int]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT chat_id FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
-        result = row[0] if row else None
-        logger.info(f"🔍 get_user_chat({user_id}) -> {result}")
-        return result
+        return row[0] if row else None
 
 async def save_user(user_id: int, chat_id: int, username: Optional[str], full_name: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -56,7 +62,6 @@ async def save_user(user_id: int, chat_id: int, username: Optional[str], full_na
             (user_id, chat_id, username, full_name)
         )
         await db.commit()
-    logger.info(f"💾 Сохранен user_id={user_id}, chat_id={chat_id}, username={username}")
 
 async def get_users_list() -> list:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -72,8 +77,6 @@ async def start_handler(message: Message):
     username = message.from_user.username
     full_name = message.from_user.full_name
     
-    logger.info(f"🚀 /start от user_id={user_id}, chat_id={message.chat.id}")
-    
     await save_user(user_id, message.chat.id, username, full_name)
     
     await message.answer(
@@ -85,8 +88,6 @@ async def start_handler(message: Message):
 @dp.message(F.from_user.id != ADMIN_ID)
 async def user_message(message: Message):
     user_id = message.from_user.id
-    
-    logger.info(f"📨 Сообщение от user_id={user_id}, chat_id={message.chat.id}, username={message.from_user.username}")
     
     await save_user(
         user_id, message.chat.id,
@@ -104,115 +105,120 @@ async def user_message(message: Message):
         f"{full_name}"
     )
     
+    # КНОПКА "Ответить"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{user_id}")]
+    ])
+    
     try:
         if message.text:
             text_content = escape_html(message.text)
-            await bot.send_message(ADMIN_ID, forward_text + f"\n\n{text_content}", parse_mode=ParseMode.HTML)
+            await bot.send_message(
+                ADMIN_ID, 
+                forward_text + f"\n\n{text_content}", 
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
         elif message.photo:
-            await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=forward_text, parse_mode=ParseMode.HTML)
+            await bot.send_photo(
+                ADMIN_ID, 
+                message.photo[-1].file_id, 
+                caption=forward_text, 
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
         elif message.voice:
-            await bot.send_voice(ADMIN_ID, message.voice.file_id, caption=forward_text, parse_mode=ParseMode.HTML)
+            await bot.send_voice(ADMIN_ID, message.voice.file_id, caption=forward_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
         elif message.video:
-            await bot.send_video(ADMIN_ID, message.video.file_id, caption=forward_text, parse_mode=ParseMode.HTML)
+            await bot.send_video(ADMIN_ID, message.video.file_id, caption=forward_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
         elif message.document:
-            await bot.send_document(ADMIN_ID, message.document.file_id, caption=forward_text, parse_mode=ParseMode.HTML)
+            await bot.send_document(ADMIN_ID, message.document.file_id, caption=forward_text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
         else:
-            await bot.send_message(ADMIN_ID, forward_text + "\n[Другое сообщение]", parse_mode=ParseMode.HTML)
+            await bot.send_message(ADMIN_ID, forward_text + "\n[Другое сообщение]", parse_mode=ParseMode.HTML, reply_markup=keyboard)
         
-        logger.info(f"✅ Переслано админу {ADMIN_ID}")
+        logger.info(f"✅ Переслано админу от user_id={user_id}")
     except Exception as e:
-        logger.error(f"❌ Ошибка пересылки админу: {e}")
+        logger.error(f"❌ Ошибка пересылки: {e}")
 
-@dp.message(F.from_user.id == ADMIN_ID)
-async def admin_message(message: Message):
-    logger.info(f"👨‍💼 Сообщение от админа, reply={message.reply_to_message is not None}")
-    
-    if not message.reply_to_message:
-        await message.answer("❗ Ответьте (reply) на сообщение пользователя\nИли /reply <user_id> <текст>")
+# Обработчик кнопки "Ответить"
+@dp.callback_query(F.data.startswith("reply_"))
+async def reply_button_clicked(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для админа")
         return
     
-    replied = message.reply_to_message
-    text_to_check = replied.text or replied.caption or ""
+    user_id = int(callback.data.split("_")[1])
     
-    if "ID: <code>" not in text_to_check:
-        await message.answer("❌ Reply на сообщение с ID пользователя")
+    # Сохраняем user_id в состояние
+    await state.update_data(reply_to_user=user_id)
+    await state.set_state(ReplyState.waiting_reply)
+    
+    await callback.message.answer(
+        f"✍️ Напишите ответ для пользователя {user_id}:\n\n"
+        f"Отправьте текст, фото, видео или документ.\n"
+        f"Для отмены: /cancel"
+    )
+    await callback.answer()
+    logger.info(f"🔘 Админ нажал 'Ответить' для user_id={user_id}")
+
+# Обработчик сообщения-ответа
+@dp.message(ReplyState.waiting_reply)
+async def process_reply_message(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get("reply_to_user")
+    
+    if not user_id:
+        await message.answer("❌ Ошибка: не найден user_id")
+        await state.clear()
+        return
+    
+    chat_id = await get_user_chat(user_id)
+    
+    if not chat_id:
+        await message.answer(f"❌ Пользователь {user_id} не найден в БД")
+        await state.clear()
         return
     
     try:
-        start = text_to_check.find("ID: <code>") + 10
-        end = text_to_check.find("</code>", start)
-        user_id_str = text_to_check[start:end]
-        user_id = int(user_id_str)
-        chat_id = await get_user_chat(user_id)
-        
-        logger.info(f"📤 Reply: user_id={user_id}, chat_id={chat_id}")
-        
-        if not chat_id:
-            await message.answer(f"❌ Пользователь {user_id} не найден в БД")
-            return
-        
         if message.text:
             await bot.send_message(chat_id, f"💬 <b>Ответ от админа:</b>\n\n{message.text}", parse_mode=ParseMode.HTML)
-            logger.info(f"✅ Reply отправлен user_id={user_id}")
+        elif message.photo:
+            caption = message.caption or ""
+            await bot.send_photo(chat_id, message.photo[-1].file_id, caption=f"💬 <b>Ответ от админа:</b>\n\n{caption}", parse_mode=ParseMode.HTML)
+        elif message.video:
+            caption = message.caption or ""
+            await bot.send_video(chat_id, message.video.file_id, caption=f"💬 <b>Ответ от админа:</b>\n\n{caption}", parse_mode=ParseMode.HTML)
+        elif message.document:
+            caption = message.caption or ""
+            await bot.send_document(chat_id, message.document.file_id, caption=f"💬 <b>Ответ от админа:</b>\n\n{caption}", parse_mode=ParseMode.HTML)
+        elif message.voice:
+            await bot.send_voice(chat_id, message.voice.file_id)
+        else:
+            await message.answer("❌ Неподдерживаемый тип сообщения")
+            await state.clear()
+            return
         
         await message.answer(f"✅ Отправлено пользователю {user_id}")
+        logger.info(f"✅ Ответ отправлен user_id={user_id}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка reply: {e}")
+        logger.error(f"❌ Ошибка отправки: {e}")
         await message.answer(f"❌ Ошибка: {e}")
+    
+    await state.clear()
 
-@dp.message(Command("reply"))
-async def admin_reply_command(message: Message):
+@dp.message(Command("cancel"))
+async def cancel_reply(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
-        logger.warning(f"⚠️ Попытка /reply от не-админа: {message.from_user.id}")
         return
     
-    logger.info(f"📝 Команда /reply от админа: {message.text}")
-    
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("📝 /reply <user_id> <текст>")
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("❌ Нет активного ответа")
         return
     
-    try:
-        user_id = int(parts[1])
-        text = parts[2]
-        
-        logger.info(f"🎯 Попытка отправки: user_id={user_id}")
-        
-        if user_id == ADMIN_ID:
-            await message.answer("❌ Нельзя отправить себе")
-            return
-        
-        chat_id = await get_user_chat(user_id)
-        
-        # DEBUG для вас
-        await message.answer(f"🔍 DEBUG:\nuser_id={user_id}\nchat_id={chat_id}\nтекст={text[:50]}")
-        
-        if not chat_id:
-            await message.answer(f"❌ chat_id не найден для user_id {user_id}")
-            logger.error(f"❌ БД не содержит user_id={user_id}")
-            return
-        
-        # Попытка отправки
-        try:
-            result = await bot.send_message(
-                chat_id, 
-                f"💬 <b>Ответ от админа:</b>\n\n{text}", 
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"✅ Отправлено! message_id={result.message_id}, chat_id={chat_id}")
-            await message.answer(f"✅ Отправлено пользователю {user_id}")
-        except Exception as send_err:
-            logger.error(f"❌ Telegram API ошибка: {send_err}")
-            await message.answer(f"❌ Не удалось отправить:\n{send_err}")
-            
-    except ValueError as ve:
-        logger.error(f"❌ ValueError: {ve}")
-        await message.answer("❌ user_id должен быть числом")
-    except Exception as e:
-        logger.error(f"❌ Общая ошибка /reply: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
+    await state.clear()
+    await message.answer("❌ Ответ отменён")
 
 @dp.message(Command("users"))
 async def list_users(message: Message):
@@ -220,8 +226,6 @@ async def list_users(message: Message):
         return
     
     users = await get_users_list()
-    logger.info(f"📋 /users вызван, найдено {len(users)} пользователей")
-    
     if not users:
         await message.answer("👥 Нет пользователей")
         return
@@ -244,7 +248,6 @@ async def clear_users(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM users")
         await db.commit()
-    logger.info("🗑️ БД очищена")
     await message.answer("🗑️ БД очищена")
 
 async def main():
