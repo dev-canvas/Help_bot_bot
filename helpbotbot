@@ -184,44 +184,50 @@ async def admin_message(message: Message):
     except (ValueError, IndexError) as e:
         await message.answer(f"❌ Ошибка парсинга user_id: {e}")
 
+
 @dp.message(Command("reply"))
 async def admin_reply_command(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        await message.answer("📝 Использование: /reply <user_id> <текст>")
+        await message.answer("📝 /reply <user_id> <текст>")
         return
     
     try:
         user_id = int(parts[1])
         text = parts[2]
+        
+        if user_id == ADMIN_ID:
+            await message.answer("❌ Нельзя отправить себе")
+            return
+        
         chat_id = await get_user_chat(user_id)
-        if chat_id:
-            await bot.send_message(chat_id, f"💬 <b>Ответ от админа:</b>\n\n{text}", parse_mode=ParseMode.HTML)
+        
+        # DEBUG
+        await message.answer(f"🔍 user_id={user_id}, chat_id из БД={chat_id}")
+        logging.info(f"Отправка: user_id={user_id}, chat_id={chat_id}, текст={text}")
+        
+        if not chat_id:
+            await message.answer(f"❌ chat_id не найден для {user_id}")
+            return
+        
+        # Попытка отправки
+        try:
+            result = await bot.send_message(chat_id, f"💬 <b>Ответ от админа:</b>\n\n{text}", parse_mode=ParseMode.HTML)
+            logging.info(f"✅ Успешно отправлено, message_id={result.message_id}")
             await message.answer(f"✅ Отправлено пользователю {user_id}")
-        else:
-            await message.answer(f"❌ Пользователь {user_id} не найден")
+        except Exception as send_error:
+            logging.error(f"❌ Ошибка отправки: {send_error}")
+            await message.answer(f"❌ Не удалось отправить: {send_error}")
+            
     except ValueError:
         await message.answer("❌ user_id должен быть числом")
+    except Exception as e:
+        logging.error(f"Общая ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
 
-@dp.message(Command("users"))
-async def list_users(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    users = await get_users_list()
-    if not users:
-        await message.answer("👥 Нет пользователей")
-        return
-    
-    text = "👥 <b>Пользователи:</b>\n\n"
-    for uid, cid, un, fn in users[:20]:
-        username = escape_html(un or "нет")
-        fullname = escape_html(fn)
-        text += f"• ID <code>{uid}</code> (@{username}) {fullname}\n"
-    
-    if len(users) > 20:
-        text += f"\n... и ещё {len(users)-20}"
-    
-    await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(Command("clear_users"))
 async def clear_users(message: Message):
