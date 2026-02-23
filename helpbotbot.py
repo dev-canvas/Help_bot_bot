@@ -85,6 +85,18 @@ async def start_handler(message: Message):
         reply_markup=ReplyKeyboardRemove()
     )
 
+# КОМАНДА /cancel ДОЛЖНА БЫТЬ ВЫШЕ user_message
+@dp.message(Command("cancel"))
+async def cancel_reply(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    
+    if current_state is None:
+        return
+    
+    await state.clear()
+    await message.answer("❌ Ответ отменён")
+    logger.info(f"❌ Админ отменил ответ")
+
 @dp.message(F.from_user.id != ADMIN_ID)
 async def user_message(message: Message):
     user_id = message.from_user.id
@@ -136,9 +148,13 @@ async def user_message(message: Message):
         else:
             await bot.send_message(ADMIN_ID, forward_text + "\n[Другое сообщение]", parse_mode=ParseMode.HTML, reply_markup=keyboard)
         
+        # ОТБИВКА ПОЛЬЗОВАТЕЛЮ
+        await message.answer("✅ Ваше сообщение отправлено. Ожидайте ответа.")
+        
         logger.info(f"✅ Переслано админу от user_id={user_id}")
     except Exception as e:
         logger.error(f"❌ Ошибка пересылки: {e}")
+        await message.answer("❌ Ошибка отправки. Попробуйте позже.")
 
 # Обработчик кнопки "Ответить"
 @dp.callback_query(F.data.startswith("reply_"))
@@ -206,19 +222,6 @@ async def process_reply_message(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {e}")
     
     await state.clear()
-
-@dp.message(Command("cancel"))
-async def cancel_reply(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("❌ Нет активного ответа")
-        return
-    
-    await state.clear()
-    await message.answer("❌ Ответ отменён")
 
 @dp.message(Command("users"))
 async def list_users(message: Message):
